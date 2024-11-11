@@ -1,0 +1,13 @@
+{
+  "name": "static-search",
+  "description": "Static Search for Publii",
+  "version": "1.0.0",
+  "license": "MIT",
+  "homepage": "https://github.com/svdm1950/static-search",
+  "authors": [
+    "Valgard Trontheim <https://trontheim.com/>"
+  ],
+  "dependencies": {
+    "fs-extra": "^11.2.0"
+  }
+}
