@@ -108,7 +108,7 @@ class StaticSearchPlugin {
     }
 
     renderSearchFeed() {
-        if (this.rendererInstance.menuContext.length !== 1 || this.rendererInstance.menuContext[0] !== 'frontpage') {
+        if (this.rendererInstance.menuContext.length !== 1 || (this.rendererInstance.menuContext[0] !== 'frontpage' && this.rendererInstance.menuContext[0] !== 'blogpage')) {
             return;
         }
 
