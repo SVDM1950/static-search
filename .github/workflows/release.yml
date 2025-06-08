@@ -1,0 +1,375 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create release for'
+        required: true
+        default: ''
+
+# Prevent multiple releases from running simultaneously
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate Tag and Version
+    runs-on: ubuntu-latest
+    
+    # Only run on tag events or workflow dispatch
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    
+    permissions:
+      contents: read
+      pull-requests: read
+    
+    outputs:
+      tag_name: ${{ steps.extract_version.outputs.tag_name }}
+      version: ${{ steps.extract_version.outputs.version }}
+      major: ${{ steps.validate_semver.outputs.major }}
+      minor: ${{ steps.validate_semver.outputs.minor }}
+      patch: ${{ steps.validate_semver.outputs.patch }}
+      prerelease: ${{ steps.validate_semver.outputs.prerelease }}
+      version_mismatch: ${{ steps.validate_package_version.outputs.version_mismatch }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history for release notes generation
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract version from tag
+        id: extract_version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # Use input tag for manual dispatch
+            TAG_NAME="${{ github.event.inputs.tag }}"
+            echo "Using manual tag: $TAG_NAME"
+          elif [[ "$GITHUB_REF" =~ ^refs/tags/ ]]; then
+            # Extract from git ref for push events
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+            echo "Extracted from push ref: $TAG_NAME"
+          else
+            echo "❌ This step should only run for tag events or workflow dispatch"
+            echo "Event: ${{ github.event_name }}, Ref: $GITHUB_REF"
+            exit 1
+          fi
+          
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          
+          # Remove 'v' prefix for version
+          VERSION=${TAG_NAME#v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          
+          echo "Final tag: $TAG_NAME"
+          echo "Final version: $VERSION"
+      
+      - name: Validate SemVer format
+        id: validate_semver
+        run: |
+          # Validate for tag events and workflow dispatch
+          if [[ "${{ github.event_name }}" != "workflow_dispatch" && ! "$GITHUB_REF" =~ ^refs/tags/ ]]; then
+            echo "❌ SemVer validation should only run for tag events or workflow dispatch"
+            echo "Event: ${{ github.event_name }}, Ref: $GITHUB_REF"
+            exit 1
+          fi
+          
+          VERSION="${{ steps.extract_version.outputs.version }}"
+          
+          # Strict SemVer regex pattern (MAJOR.MINOR.PATCH with optional pre-release)
+          SEMVER_PATTERN='^([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z-]+)*$'
+          
+          if [[ $VERSION =~ $SEMVER_PATTERN ]]; then
+            echo "✅ Valid SemVer format: $VERSION"
+            echo "valid=true" >> $GITHUB_OUTPUT
+            
+            # Extract major, minor, patch
+            echo "major=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+            echo "minor=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+            echo "patch=${BASH_REMATCH[3]}" >> $GITHUB_OUTPUT
+            echo "prerelease=${BASH_REMATCH[5]}" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Invalid SemVer format: $VERSION"
+            echo "valid=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+      
+      - name: Check if release already exists
+        id: check_release
+        run: |
+          TAG_NAME="${{ steps.extract_version.outputs.tag_name }}"
+          
+          # Check if release already exists
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "❌ Release $TAG_NAME already exists"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "✅ Release $TAG_NAME does not exist yet"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'yarn'
+      
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+      
+      - name: Validate package.json version
+        id: validate_package_version
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          TAG_VERSION="${{ steps.extract_version.outputs.version }}"
+          
+          echo "Package.json version: $PACKAGE_VERSION"
+          echo "Tag version: $TAG_VERSION"
+          
+          if [ "$PACKAGE_VERSION" != "$TAG_VERSION" ]; then
+            echo "⚠️  Warning: package.json version ($PACKAGE_VERSION) does not match tag version ($TAG_VERSION)"
+            echo "version_mismatch=true" >> $GITHUB_OUTPUT
+          else
+            echo "✅ Package.json version matches tag version"
+            echo "version_mismatch=false" >> $GITHUB_OUTPUT
+          fi
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: validate
+    
+    # Only run on tag events or workflow dispatch (additional safety check)
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    
+    permissions:
+      contents: write
+      pull-requests: read
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history for release notes generation
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'yarn'
+      
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+      
+      - name: Create plugin release archive
+        id: create_archive
+        run: |
+          TAG_NAME="${{ needs.validate.outputs.tag_name }}"
+          ARCHIVE_NAME="static-search-plugin-${TAG_NAME}.zip"
+          
+          echo "Creating plugin archive: $ARCHIVE_NAME"
+          
+          # Create temporary directory for plugin files
+          mkdir -p plugin-release
+          
+          # Copy required files to plugin directory
+          cp main.js plugin-release/
+          cp plugin.json plugin-release/
+          cp README.md plugin-release/
+          cp thumbnail.svg plugin-release/
+          cp -r images/ plugin-release/
+          cp -r node_modules/ plugin-release/
+          
+          # Create ZIP archive
+          cd plugin-release
+          zip -r "../$ARCHIVE_NAME" .
+          cd ..
+          
+          # Verify archive contents
+          echo "Archive contents:"
+          unzip -l "$ARCHIVE_NAME"
+          
+          echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+          echo "archive_path=$(pwd)/$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+      
+      - name: Generate release notes
+        id: generate_notes
+        run: |
+          TAG_NAME="${{ needs.validate.outputs.tag_name }}"
+          
+          # Get the previous tag (excluding the current tag)
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 "$TAG_NAME^" 2>/dev/null || echo "")
+          
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "No previous tag found, generating notes from first commit to $TAG_NAME"
+            # Get first commit hash
+            FIRST_COMMIT=$(git rev-list --max-parents=0 HEAD)
+            COMMIT_RANGE="$FIRST_COMMIT..$TAG_NAME"
+          else
+            echo "Previous tag: $PREVIOUS_TAG, current tag: $TAG_NAME"
+            COMMIT_RANGE="$PREVIOUS_TAG..$TAG_NAME"
+          fi
+          
+          echo "Using commit range: $COMMIT_RANGE"
+          
+          # Generate release notes
+          echo "## What's Changed" > release_notes.md
+          echo "" >> release_notes.md
+          
+          # Get commits since last tag
+          git log --pretty=format:"* %s (%h)" $COMMIT_RANGE >> release_notes.md
+          
+          # Add additional information
+          echo "" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "## Release Information" >> release_notes.md
+          echo "* **Version:** ${{ needs.validate.outputs.version }}" >> release_notes.md
+          echo "* **Tag:** $TAG_NAME" >> release_notes.md
+          echo "* **Release Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> release_notes.md
+          
+          if [ "${{ needs.validate.outputs.version_mismatch }}" == "true" ]; then
+            echo "* **Note:** Package.json version differs from tag version" >> release_notes.md
+          fi
+          
+          # Check if it's a prerelease
+          if [[ "${{ needs.validate.outputs.prerelease }}" != "" ]]; then
+            echo "* **Type:** Pre-release" >> release_notes.md
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "* **Type:** Stable release" >> release_notes.md
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "Generated release notes:"
+          cat release_notes.md
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'yarn'
+      
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+      
+      - name: Create plugin release archive
+        id: create_final_archive
+        run: |
+          PLUGIN_NAME="static-search-plugin"
+          ARCHIVE_NAME="${PLUGIN_NAME}-${{ needs.validate.outputs.tag_name }}.zip"
+          
+          echo "Creating plugin archive: $ARCHIVE_NAME"
+          
+          # Create temporary directory for plugin files
+          mkdir -p temp-plugin
+          
+          # Copy required files to temp directory
+          cp main.js temp-plugin/
+          cp plugin.json temp-plugin/
+          cp README.md temp-plugin/
+          cp thumbnail.svg temp-plugin/
+          cp release_notes.md temp-plugin/
+          cp -r images/ temp-plugin/
+          cp -r node_modules/ temp-plugin/
+          
+          # Create zip archive
+          cd temp-plugin
+          zip -r "../$ARCHIVE_NAME" .
+          cd ..
+          
+          # Verify archive contents
+          echo "Archive contents:"
+          unzip -l "$ARCHIVE_NAME"
+          
+          echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+          echo "archive_path=$(pwd)/$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+      
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag_name }}
+          name: Release ${{ needs.validate.outputs.tag_name }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ steps.generate_notes.outputs.prerelease }}
+          generate_release_notes: true  # GitHub will append auto-generated notes
+          make_latest: ${{ steps.generate_notes.outputs.prerelease == 'false' }}
+          files: |
+            ${{ steps.create_final_archive.outputs.archive_path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Remove default source code assets
+        run: |
+          TAG_NAME="${{ needs.validate.outputs.tag_name }}"
+          
+          echo "Removing default source code assets from release..."
+          
+          # Get release ID
+          RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/$TAG_NAME --jq '.id')
+          
+          # Get all assets
+          ASSETS=$(gh api repos/${{ github.repository }}/releases/$RELEASE_ID/assets --jq '.[] | select(.name | test("^(Source code|source-code)")) | .id')
+          
+          # Delete source code assets
+          for asset_id in $ASSETS; do
+            echo "Deleting asset ID: $asset_id"
+            gh api --method DELETE repos/${{ github.repository }}/releases/assets/$asset_id || echo "Failed to delete asset $asset_id"
+          done
+          
+          echo "Default source code assets removed"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Release Summary
+        run: |
+          echo "## 🎉 Release Created Successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "* **Tag:** ${{ needs.validate.outputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "* **Version:** ${{ needs.validate.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "* **Type:** ${{ steps.generate_notes.outputs.prerelease == 'true' && 'Pre-release' || 'Stable Release' }}" >> $GITHUB_STEP_SUMMARY
+          echo "* **Release URL:** ${{ steps.create_release.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "* **Plugin Archive:** ${{ steps.create_final_archive.outputs.archive_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Plugin Archive Contents" >> $GITHUB_STEP_SUMMARY
+          echo "* main.js - Haupt-Plugin-Datei" >> $GITHUB_STEP_SUMMARY
+          echo "* plugin.json - Plugin-Metadaten" >> $GITHUB_STEP_SUMMARY
+          echo "* README.md - Dokumentation" >> $GITHUB_STEP_SUMMARY
+          echo "* thumbnail.svg - Plugin-Thumbnail" >> $GITHUB_STEP_SUMMARY
+          echo "* release_notes.md - Release-Notizen" >> $GITHUB_STEP_SUMMARY
+          echo "* images/ - Screenshots" >> $GITHUB_STEP_SUMMARY
+          echo "* node_modules/ - Node.js Dependencies" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### SemVer Details" >> $GITHUB_STEP_SUMMARY
+          echo "* **Major:** ${{ needs.validate.outputs.major }}" >> $GITHUB_STEP_SUMMARY
+          echo "* **Minor:** ${{ needs.validate.outputs.minor }}" >> $GITHUB_STEP_SUMMARY
+          echo "* **Patch:** ${{ needs.validate.outputs.patch }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.validate.outputs.prerelease }}" != "" ]; then
+            echo "* **Pre-release:** ${{ needs.validate.outputs.prerelease }}" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "## ❌ Release Failed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "The release process failed. Please check the logs above for details." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Common issues:" >> $GITHUB_STEP_SUMMARY
+          echo "* Invalid SemVer format in tag" >> $GITHUB_STEP_SUMMARY
+          echo "* Release already exists" >> $GITHUB_STEP_SUMMARY
+          echo "* Insufficient permissions" >> $GITHUB_STEP_SUMMARY
+          echo "* Network connectivity issues" >> $GITHUB_STEP_SUMMARY
